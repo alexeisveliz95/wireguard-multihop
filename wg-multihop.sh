@@ -101,8 +101,8 @@ run_wg_quick() {
         echo "    [DRY-RUN] wg-quick ${action} ${conf}" >&2
         return 0
     fi
-    wg-quick "$action" "$conf" 2>&1 | grep -v "Warning:" || return 1
-    return 0
+    wg-quick "$action" "$conf" 2>&1 | grep -v "Warning:" || true
+    return "${PIPESTATUS[0]}"
 }
 
 # ============================================================================
@@ -356,7 +356,7 @@ PersistentKeepalive = 5
 EOF
     dry chmod 600 "${WG_DIR}/wg1.conf"
     log "Levantando wg1..."
-    run_wg_quick "${WG_DIR}/wg1.conf" up
+    run_wg_quick "${WG_DIR}/wg1.conf" up || true
     # Forzar handshake inicial
     local peer
     peer=$(wg show wg1 peers 2>/dev/null | head -1 || true)
@@ -402,9 +402,10 @@ __add_peer_to_wg0() {
 PublicKey = ${pub}
 AllowedIPs = ${ip}
 EOF
-    dry wg syncconf wg0 <(wg-quick strip "${WG_DIR}/wg0.conf" 2>/dev/null) 2>/dev/null || \
-        dry wg addconf wg0 <(echo "[Peer]" ; echo "PublicKey = ${pub}" ; echo "AllowedIPs = ${ip}") 2>/dev/null || \
-        log "wg0 recargado"
+    if ! dry wg syncconf wg0 <(wg-quick strip "${WG_DIR}/wg0.conf" 2>/dev/null) 2>/dev/null; then
+        dry wg addconf wg0 <(echo "[Peer]" ; echo "PublicKey = ${pub}" ; echo "AllowedIPs = ${ip}") 2>/dev/null || true
+    fi
+    log "wg0 recargado"
 }
 
 __remove_peer_from_wg0() {
@@ -543,7 +544,9 @@ cmd_install() {
     log "  • Watchdog: $([ "$WD_ENABLE" == "1" ] && echo "cada 5 min via cron" || echo "OFF")"
     echo ""
 
-    [[ "$BATCH" == "0" ]] && confirm "Aplicar cambios" "Y" || true
+    if [[ "$BATCH" == "0" ]]; then
+        confirm "Aplicar cambios" "Y" || { info "Cancelado"; exit 0; }
+    fi
 
     # Rollback automático si algo falla
     _INSTALL_FAILED=1
@@ -960,7 +963,7 @@ cmd_watchdog() {
     mem=$(free -m | awk '/Mem:/{print $4}')
     if [[ "$mem" -lt 50 ]]; then
         echo "[$(date)] RAM baja: ${mem}MB — limpiando caché" >> "$logfile"
-        echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+        dry bash -c "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null || true
         fixed=1
     fi
 
@@ -1048,14 +1051,32 @@ cmd_recover() {
 
 cmd_test() {
     check_root
-    local TMPDIR="/tmp/wg-multihop-test"
-    local NS_VPS="wgtest-mh-vps"
-    local NS_CLIENT="wgtest-mh-client"
-    local NS_SS="wgtest-mh-ss"
-    local VETH_V="mh-veth-v"
-    local VETH_C="mh-veth-c"
-    local VETH_V2="mh-veth-v2"
-    local VETH_S="mh-veth-s"
+
+    # Globales (necesarias en el EXIT trap)
+    TMPDIR="/tmp/wg-multihop-test"
+    NS_VPS="wgtest-mh-vps"
+    NS_CLIENT="wgtest-mh-client"
+    NS_SS="wgtest-mh-ss"
+    VETH_V="mh-veth-v"
+    VETH_C="mh-veth-c"
+    VETH_V2="mh-veth-v2"
+    VETH_S="mh-veth-s"
+    client_wg0=""
+
+    _test_cleanup() {
+        local cl="${client_wg0:-}"
+        [[ -n "$cl" ]] && ip netns exec "$NS_VPS" wg-quick down "$cl" 2>/dev/null || true
+        for ns in "$NS_CLIENT" "$NS_VPS" "$NS_SS"; do
+            ip netns exec "$ns" wg-quick down wg0 2>/dev/null || true
+            ip netns exec "$ns" wg-quick down wg1 2>/dev/null || true
+            ip netns del "$ns" 2>/dev/null || true
+        done
+        for v in "$VETH_C" "$VETH_V" "$VETH_V2" "$VETH_S"; do
+            ip link del "$v" 2>/dev/null || true
+        done
+        rm -rf "$TMPDIR" 2>/dev/null || true
+    }
+    trap _test_cleanup EXIT
     local WG_PORT="${WG_PORT:-51820}"
     local failed=0 passed=0
 
@@ -1358,23 +1379,7 @@ EOF
         echo "FAIL"; failed=$((failed+1))
     fi
 
-    # --- Cleanup ---
-    echo ""
-    echo "  [lab] Limpiando..."
-    ip netns exec "$NS_CLIENT" wg-quick down "$client_wg0" 2>/dev/null || true
-    ip netns exec "$NS_VPS" wg-quick down wg0 2>/dev/null || true
-    ip netns exec "$NS_VPS" wg-quick down wg1 2>/dev/null || true
-    ip netns exec "$NS_SS" wg-quick down wg1 2>/dev/null || true
-    ip netns exec "$NS_SS" wg-quick down "$TMPDIR/ss-wg1.conf" 2>/dev/null || true
-    for ns in "$NS_CLIENT" "$NS_VPS" "$NS_SS"; do
-        ip netns del "$ns" 2>/dev/null || true
-    done
-    for v in "$VETH_C" "$VETH_V" "$VETH_V2" "$VETH_S"; do
-        ip link del "$v" 2>/dev/null || true
-    done
-    rm -rf "$TMPDIR"
-
-    # --- Results ---
+    # Results ---
     echo ""
     echo "  ═══════════════════════════════════════"
     if [[ "$failed" -eq 0 ]]; then
