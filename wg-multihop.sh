@@ -312,6 +312,7 @@ ListenPort = ${WG_PORT}
 MTU = ${WG0_MTU}
 Table = off
 
+PostUp = ip rule add to ${subnet_base}.0/${subnet_prefix} table main priority 99 2>/dev/null || true
 PostUp = ip rule add from ${subnet_base}.0/${subnet_prefix} table wg_clients priority 200 2>/dev/null || true
 PostUp = ip route add default dev wg1 table wg_clients 2>/dev/null || true
 PostUp = ip route add ${subnet_base}.0/${subnet_prefix} dev wg0 table wg_clients 2>/dev/null || true
@@ -320,6 +321,7 @@ PostUp = iptables -C FORWARD -i wg0 -o wg1 -j ACCEPT 2>/dev/null || iptables -A 
 PostUp = iptables -C FORWARD -i wg1 -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i wg1 -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
 PostUp = iptables -t nat -C POSTROUTING -o wg1 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o wg1 -j MASQUERADE 2>/dev/null || true
 
+PostDown = ip rule del to ${subnet_base}.0/${subnet_prefix} table main 2>/dev/null || true
 PostDown = ip rule del from ${subnet_base}.0/${subnet_prefix} table wg_clients 2>/dev/null || true
 PostDown = ip route flush table wg_clients 2>/dev/null || true
 PostDown = iptables -D FORWARD -i wg0 -o wg1 -j ACCEPT 2>/dev/null || true
@@ -341,6 +343,7 @@ EOF
             break
         fi
         sleep 1
+        ip rule add to ${subnet_base}.0/${subnet_prefix} table main priority 99 2>/dev/null || true
         ip route add default dev wg1 table wg_clients 2>/dev/null || true
         ip route add ${subnet_base}.0/${subnet_prefix} dev wg0 table wg_clients 2>/dev/null || true
         ip route add blackhole 0.0.0.0/0 table wg_clients metric 999 2>/dev/null || true
@@ -838,6 +841,7 @@ cmd_multihop() {
         # Activar wg1 + MASQUERADE
         dry wg-quick up "${WG_DIR}/wg1.conf" 2>/dev/null || true
         dry wg set wg1 peer "$peer" endpoint "$(grep -oP 'Endpoint = \K\S+' "${WG_DIR}/wg1.conf" 2>/dev/null)" 2>/dev/null || true
+        dry ip rule add to "${WG0_SUBNET}" table main priority 99 2>/dev/null || true
         dry ip route add default dev wg1 table wg_clients 2>/dev/null || true
         dry iptables -t nat -A POSTROUTING -o wg1 -j MASQUERADE 2>/dev/null || true
         dry bash -c "echo 'ON' > '${MULTIHOP_STATE}'"
@@ -1017,6 +1021,7 @@ cmd_uninstall() {
     dry iptables -t mangle -F 2>/dev/null || true
 
     log "Eliminando reglas de ruteo..."
+    dry ip rule del to 10.8.0.0/24 table main 2>/dev/null || true
     dry ip rule del from 10.8.0.0/24 table wg_clients 2>/dev/null || true
     dry ip rule del from "$(__detect_ip "$(__detect_wan)" | cut -d/ -f1)" table mgmt 2>/dev/null || true
     dry ip route flush table wg_clients 2>/dev/null || true
@@ -1054,6 +1059,7 @@ cmd_recover() {
     wg-quick down "${WG_DIR}/wg1.conf" 2>/dev/null || true
 
     log "Limpiando tablas de ruteo..."
+    ip rule del to 10.8.0.0/24 table main 2>/dev/null || true
     ip rule del from 10.8.0.0/24 table wg_clients 2>/dev/null || true
     ip route flush table wg_clients 2>/dev/null || true
     ip route flush table mgmt 2>/dev/null || true
