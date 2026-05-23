@@ -314,6 +314,28 @@ __install_mgmt_routing() {
     else
         warn "No gateway detected, skipping mgmt routing (can be configured manually)"
     fi
+
+    # Instalar systemd service para persistencia en boot
+    local persist_script="/usr/local/bin/wg-multihop-persist.sh"
+    local persist_unit="/etc/systemd/system/wg-multihop-persist.service"
+    local script_dir
+    script_dir=$(dirname "$(readlink -f "$0")")
+
+    dry cp "${script_dir}/wg-multihop-persist.sh" "$persist_script" 2>/dev/null || \
+        dry install -m 755 /dev/null "$persist_script"
+    dry cp "${script_dir}/wg-multihop-persist.service" "$persist_unit" 2>/dev/null || \
+        dry install -m 644 /dev/null "$persist_unit"
+
+    if [[ "$DRY_RUN" != "1" ]]; then
+        chmod 755 "$persist_script" 2>/dev/null || true
+        chmod 644 "$persist_unit" 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable wg-multihop-persist.service 2>/dev/null || true
+        systemctl start wg-multihop-persist.service 2>/dev/null || true
+        log "systemd service wg-multihop-persist installed and enabled"
+    else
+        echo "    [DRY-RUN] cp + chmod + systemctl enable wg-multihop-persist.service" >&2
+    fi
 }
 
 __install_wg0() {
@@ -1317,6 +1339,12 @@ cmd_watchdog() {
     wan_ip=$(__detect_ip "$(__detect_wan)" | cut -d/ -f1)
     gw=$(ip route show default 2>/dev/null | grep -oP 'via \K\S+' | head -1 || echo "")
     if [[ -n "$gw" && "$wan_ip" != "0.0.0.0" ]]; then
+        # Ensure rt_tables has mgmt entry
+        if ! grep -q "^100\s\+mgmt" /etc/iproute2/rt_tables 2>/dev/null; then
+            echo "[$(date)] rt_tables mgmt faltante — restaurando" >> "$logfile"
+            echo '100 mgmt' >> /etc/iproute2/rt_tables
+            fixed=1
+        fi
         if ! ip rule show 2>/dev/null | grep -q "from ${wan_ip}.*table mgmt"; then
             echo "[$(date)] mgmt rule faltante — restaurando" >> "$logfile"
             ip route add default via "$gw" dev "$(__detect_wan)" table mgmt 2>/dev/null || true
@@ -1328,12 +1356,24 @@ cmd_watchdog() {
             ip route add default via "$gw" dev "$(__detect_wan)" table mgmt 2>/dev/null || true
             fixed=1
         fi
+        # Ensure systemd persist service is active
+        if ! systemctl is-active --quiet wg-multihop-persist.service 2>/dev/null; then
+            echo "[$(date)] systemd persist service caido — reiniciando" >> "$logfile"
+            systemctl start wg-multihop-persist.service 2>/dev/null || true
+            fixed=1
+        fi
     fi
 
     # 4. Routing table wg_clients (routes + blackhole)
     local tb="wg_clients"
     local active_def="wg1"
     [[ -f "$ACTIVE_PROVIDER" ]] && active_def=$(cat "$ACTIVE_PROVIDER")
+    # Ensure rt_tables has wg_clients entry
+    if ! grep -q "^200\s\+wg_clients" /etc/iproute2/rt_tables 2>/dev/null; then
+        echo "[$(date)] rt_tables wg_clients faltante — restaurando" >> "$logfile"
+        echo '200 wg_clients' >> /etc/iproute2/rt_tables
+        fixed=1
+    fi
     if ! ip route show table "$tb" 2>/dev/null | grep -q "default" && \
        ! ip route show table 200 2>/dev/null | grep -q "default"; then
         echo "[$(date)] wg_clients default route faltante — restaurando via ${active_def}" >> "$logfile"
@@ -1435,13 +1475,24 @@ cmd_uninstall() {
     dry crontab -l 2>/dev/null | grep -v "wg-multihop.sh" | crontab - 2>/dev/null || true
     dry rm -f /etc/cron.d/wg-multihop 2>/dev/null || true
 
+    log "Eliminando systemd persist service..."
+    dry systemctl disable wg-multihop-persist.service 2>/dev/null || true
+    dry systemctl stop wg-multihop-persist.service 2>/dev/null || true
+    dry rm -f /etc/systemd/system/wg-multihop-persist.service 2>/dev/null || true
+    dry rm -f /usr/local/bin/wg-multihop-persist.sh 2>/dev/null || true
+    dry systemctl daemon-reload 2>/dev/null || true
+
     log "WireGuard Multihop desinstalado"
 }
 
 cmd_recover() {
     check_root
-    title "Emergency recovery"
+    title "Emergency network recovery"
     local backup_file="/etc/iptables/rules.v4.pre-wg-multihop"
+
+    log "This command restores network connectivity WITHOUT deleting WireGuard configs."
+    log "For full uninstall (delete all configs), use: bash $0 uninstall"
+    echo ""
 
     if [[ -f "$backup_file" ]]; then
         log "Restaurando iptables desde backup..."
@@ -1458,30 +1509,29 @@ cmd_recover() {
         [[ -f "${WG_DIR}/${iface}.conf" ]] && wg-quick down "${WG_DIR}/${iface}.conf" 2>/dev/null || true
     done
 
-    log "Limpiando tablas de ruteo..."
+    log "Restaurando ruta default vía WAN..."
+    local wan_iface
+    wan_iface=$(ip -4 route show default 2>/dev/null | grep -oP 'dev \K\S+' | head -1 || echo "eth0")
+    local gw
+    gw=$(ip -4 route show default 2>/dev/null | grep -oP 'via \K\S+' | head -1 || echo "")
+    if [[ -n "$gw" && -n "$wan_iface" ]]; then
+        ip route replace default via "$gw" dev "$wan_iface" 2>/dev/null || true
+        log "Default route: via ${gw} dev ${wan_iface}"
+    fi
+
+    log "Limpiando reglas de ruteo de WireGuard..."
     ip rule del to "${WG0_SUBNET}" table main 2>/dev/null || true
     ip rule del from "${WG0_SUBNET}" table wg_clients 2>/dev/null || true
+    ip rule del from "$(__detect_ip "$(__detect_wan)" | cut -d/ -f1)" table mgmt 2>/dev/null || true
     ip route flush table wg_clients 2>/dev/null || true
     ip route flush table mgmt 2>/dev/null || true
-    sed -i '/^200 wg_clients/d' /etc/iproute2/rt_tables 2>/dev/null || true
-    sed -i '/^100 mgmt/d' /etc/iproute2/rt_tables 2>/dev/null || true
+    # NOTA: NO eliminar rt_tables entries — se reusan al reinstalar
 
-    log "Eliminando cron..."
-    crontab -l 2>/dev/null | grep -v "wg-multihop.sh" | crontab - 2>/dev/null || true
-    rm -f /etc/cron.d/wg-multihop 2>/dev/null || true
+    log "Relanzando systemd persist service..."
+    systemctl start wg-multihop-persist.service 2>/dev/null || true
 
-    log "Deshabilitando IP forwarding..."
-    sysctl -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
-
-    log "Eliminando config persistente..."
-    rm -f "$WG_PERSIST" 2>/dev/null || true
-
-    log "Cleaning up config files..."
-    rm -f "${WG_DIR}/wg0.conf" "${WG_DIR}/wg1.conf" "${WG_DIR}/wg2.conf" 2>/dev/null || true
-    rm -f "${WG_DIR}/wg1_private.key" "${WG_DIR}/vps_private.key" "${WG_DIR}/vps_public.key" 2>/dev/null || true
-    rm -f "$MULTIHOP_STATE" "$ACTIVE_PROVIDER" 2>/dev/null || true
-
-    log "Recovery complete. System is in pre-install state."
+    log "Recovery completo. WireGuard configs preserved en ${WG_DIR}"
+    log "Para reactivar wg-multihop: bash $0 multihog on"
 }
 
 cmd_test() {
@@ -1901,8 +1951,8 @@ main() {
             echo "    watchdog             Self-heal (runs via cron)"
             echo "    failover [wg1|wg2]   Switch active provider"
             echo "    tor [on|off|status]  Tor transparent proxy"
-            echo "    uninstall            Revert everything"
-            echo "    recover              Emergency recovery (restore iptables + clean WG)"
+            echo "    uninstall            Revert everything (delete all configs)"
+            echo "    recover              Emergency recovery (restore network, keep WG configs)"
             echo "    test                 Self-test in isolated namespaces"
             echo ""
             echo "  Environment variables:"
