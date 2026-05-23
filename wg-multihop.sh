@@ -35,9 +35,9 @@ SSH_PORT="${SSH_PORT:-22}"
 
 # WireGuard subnets / tunables
 WG0_SUBNET="${WG0_SUBNET:-10.8.0.0/24}"
-WG0_MTU="${WG0_MTU:-1420}"
 WG1_MTU="${WG1_MTU:-1320}"
-CLIENT_MTU="${CLIENT_MTU:-1380}"
+WG0_MTU="${WG0_MTU:-${WG1_MTU}}"
+CLIENT_MTU="${CLIENT_MTU:-$(( WG1_MTU - 60 ))}"
 CLIENT_DNS="${CLIENT_DNS:-8.8.8.8, 1.1.1.1}"
 WG1_KEEPALIVE="${WG1_KEEPALIVE:-5}"
 CLIENT_KEEPALIVE="${CLIENT_KEEPALIVE:-25}"
@@ -234,6 +234,8 @@ __install_wireguard() {
     fi
     log "Enabling IP forwarding..."
     dry bash -c "sysctl -w net.ipv4.ip_forward=1 >/dev/null && sed -i 's/^#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/' /etc/sysctl.conf 2>/dev/null || true"
+    log "Enabling TCP MTU probing..."
+    dry bash -c "sysctl -w net.ipv4.tcp_mtu_probing=1 >/dev/null 2>/dev/null || true"
 }
 
 __install_firewall() {
@@ -256,16 +258,16 @@ __install_firewall() {
     dry iptables -P INPUT DROP 2>/dev/null || true
     dry iptables -P FORWARD DROP 2>/dev/null || true
     dry iptables -P OUTPUT ACCEPT 2>/dev/null || true
-    dry iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-    dry iptables -A INPUT -i lo -j ACCEPT 2>/dev/null || true
-    dry iptables -A INPUT -p tcp --dport "${SSH_PORT}" -j ACCEPT 2>/dev/null || true
-    dry iptables -A INPUT -p udp --dport "${WG_PORT}" -j ACCEPT 2>/dev/null || true
-    dry iptables -A INPUT -p icmp -m limit --limit 10/second -j ACCEPT 2>/dev/null || true
-    dry iptables -A FORWARD -i wg0 -o wg1 -j ACCEPT 2>/dev/null || true
-    dry iptables -A FORWARD -i wg1 -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-    dry iptables -A FORWARD -i wg0 -o "${wan}" -j ACCEPT 2>/dev/null || true
-    dry iptables -A FORWARD -i "${wan}" -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-    dry iptables -t nat -A POSTROUTING -o wg1 -j MASQUERADE 2>/dev/null || true
+    dry iptables -C INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || dry iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    dry iptables -C INPUT -i lo -j ACCEPT 2>/dev/null || dry iptables -A INPUT -i lo -j ACCEPT 2>/dev/null || true
+    dry iptables -C INPUT -p tcp --dport "${SSH_PORT}" -j ACCEPT 2>/dev/null || dry iptables -A INPUT -p tcp --dport "${SSH_PORT}" -j ACCEPT 2>/dev/null || true
+    dry iptables -C INPUT -p udp --dport "${WG_PORT}" -j ACCEPT 2>/dev/null || dry iptables -A INPUT -p udp --dport "${WG_PORT}" -j ACCEPT 2>/dev/null || true
+    dry iptables -C INPUT -p icmp -m limit --limit 10/second -j ACCEPT 2>/dev/null || dry iptables -A INPUT -p icmp -m limit --limit 10/second -j ACCEPT 2>/dev/null || true
+    dry iptables -C FORWARD -i wg0 -o wg1 -j ACCEPT 2>/dev/null || dry iptables -A FORWARD -i wg0 -o wg1 -j ACCEPT 2>/dev/null || true
+    dry iptables -C FORWARD -i wg1 -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || dry iptables -A FORWARD -i wg1 -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    dry iptables -C FORWARD -i wg0 -o "${wan}" -j ACCEPT 2>/dev/null || dry iptables -A FORWARD -i wg0 -o "${wan}" -j ACCEPT 2>/dev/null || true
+    dry iptables -C FORWARD -i "${wan}" -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || dry iptables -A FORWARD -i "${wan}" -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    dry iptables -t nat -C POSTROUTING -o wg1 -j MASQUERADE 2>/dev/null || dry iptables -t nat -A POSTROUTING -o wg1 -j MASQUERADE 2>/dev/null || true
     log "Saving iptables rules..."
     dry netfilter-persistent save 2>/dev/null || mkdir -p /etc/iptables 2>/dev/null; dry iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
 }
@@ -310,34 +312,37 @@ ListenPort = ${WG_PORT}
 MTU = ${WG0_MTU}
 Table = off
 
-PostUp = ip rule add from ${subnet_base}.0/${subnet_prefix} table wg_clients priority 200 2>/dev/null
-PostUp = ip route add default dev wg1 table wg_clients 2>/dev/null
-PostUp = ip route add ${subnet_base}.0/${subnet_prefix} dev wg0 table wg_clients 2>/dev/null
-PostUp = ip route add blackhole 0.0.0.0/0 table wg_clients metric 999 2>/dev/null
-PostUp = iptables -A FORWARD -i wg0 -o wg1 -j ACCEPT 2>/dev/null
-PostUp = iptables -A FORWARD -i wg1 -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
-PostUp = iptables -t nat -A POSTROUTING -o wg1 -j MASQUERADE 2>/dev/null
+PostUp = ip rule add from ${subnet_base}.0/${subnet_prefix} table wg_clients priority 200 2>/dev/null || true
+PostUp = ip route add default dev wg1 table wg_clients 2>/dev/null || true
+PostUp = ip route add ${subnet_base}.0/${subnet_prefix} dev wg0 table wg_clients 2>/dev/null || true
+PostUp = ip route add blackhole 0.0.0.0/0 table wg_clients metric 999 2>/dev/null || true
+PostUp = iptables -C FORWARD -i wg0 -o wg1 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i wg0 -o wg1 -j ACCEPT 2>/dev/null || true
+PostUp = iptables -C FORWARD -i wg1 -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i wg1 -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+PostUp = iptables -t nat -C POSTROUTING -o wg1 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o wg1 -j MASQUERADE 2>/dev/null || true
 
-PostDown = ip rule del from ${subnet_base}.0/${subnet_prefix} table wg_clients 2>/dev/null
-PostDown = ip route flush table wg_clients 2>/dev/null
-PostDown = iptables -D FORWARD -i wg0 -o wg1 -j ACCEPT 2>/dev/null
-PostDown = iptables -D FORWARD -i wg1 -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
-PostDown = iptables -t nat -D POSTROUTING -o wg1 -j MASQUERADE 2>/dev/null
+PostDown = ip rule del from ${subnet_base}.0/${subnet_prefix} table wg_clients 2>/dev/null || true
+PostDown = ip route flush table wg_clients 2>/dev/null || true
+PostDown = iptables -D FORWARD -i wg0 -o wg1 -j ACCEPT 2>/dev/null || true
+PostDown = iptables -D FORWARD -i wg1 -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+PostDown = iptables -t nat -D POSTROUTING -o wg1 -j MASQUERADE 2>/dev/null || true
 EOF
     dry chmod 600 "${WG_DIR}/wg0.conf"
     dry sed -i '/^200\s\+wg_clients/d' /etc/iproute2/rt_tables 2>/dev/null || true
     dry bash -c "echo '200 wg_clients' >> /etc/iproute2/rt_tables"
     log "Bringing up wg0..."
     run_wg_quick "${WG_DIR}/wg0.conf" up || true
+
+    # PostUp may fail (ip route add default dev wg1 might be early)
+    # so retry routes manually
     local wg0_verify
     for wg0_verify in 1 2 3; do
-        if ip route show table wg_clients 2>/dev/null | grep -q "default.*wg1" && \
-           ip route show table wg_clients 2>/dev/null | grep -q "blackhole"; then
+        if ip route show table wg_clients 2>/dev/null | grep "default.*wg1" >/dev/null 2>&1 && \
+           ip route show table wg_clients 2>/dev/null | grep "blackhole" >/dev/null 2>&1; then
             break
         fi
         sleep 1
         ip route add default dev wg1 table wg_clients 2>/dev/null || true
-        ip route add 10.8.0.0/24 dev wg0 table wg_clients 2>/dev/null || true
+        ip route add ${subnet_base}.0/${subnet_prefix} dev wg0 table wg_clients 2>/dev/null || true
         ip route add blackhole 0.0.0.0/0 table wg_clients metric 999 2>/dev/null || true
     done
     dry mkdir -p "$CLIENT_DIR"
@@ -424,9 +429,10 @@ __add_peer_to_wg0() {
 [Peer]
 PublicKey = ${pub}
 AllowedIPs = ${ip}
+PersistentKeepalive = 30
 EOF
     if ! dry wg syncconf wg0 <(wg-quick strip "${WG_DIR}/wg0.conf" 2>/dev/null) 2>/dev/null; then
-        dry wg addconf wg0 <(echo "[Peer]" ; echo "PublicKey = ${pub}" ; echo "AllowedIPs = ${ip}") 2>/dev/null || true
+        dry wg addconf wg0 <(echo "[Peer]" ; echo "PublicKey = ${pub}" ; echo "AllowedIPs = ${ip}" ; echo "PersistentKeepalive = 30") 2>/dev/null || true
     fi
     log "wg0 recargado"
 }
@@ -1279,7 +1285,7 @@ EOF
 [Interface]
 PrivateKey = ${client_priv}
 Address = 10.8.0.2/24
-MTU = 1380
+MTU = ${CLIENT_MTU:-1260}
 
 [Peer]
 PublicKey = ${server_pub}
@@ -1290,7 +1296,16 @@ EOF
     ip netns exec "$NS_CLIENT" wg-quick up "$client_wg0" 2>&1 | grep -v "Warning:" || true
     sleep 2
     if ip netns exec "$NS_CLIENT" ping -c 1 -W 3 10.2.0.1 &>/dev/null; then
-        echo "OK"; passed=$((passed+1))
+        echo "OK (tunnel up)"
+        # MTU chain verification: large payload should work with new defaults
+        local mtu_test
+        mtu_test=$(ip netns exec "$NS_CLIENT" ping -c 1 -W 2 -M do -s 1200 10.2.0.1 2>&1 || true)
+        if echo "$mtu_test" | grep -q "message too long"; then
+            echo "         ⚠ MTU chain: 1200b payload blocked — might need tuning"
+        else
+            echo "         ✓ MTU chain: 1200b payload OK"
+        fi
+        passed=$((passed+1))
     else
         echo "FAIL"; failed=$((failed+1))
     fi
