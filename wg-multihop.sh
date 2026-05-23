@@ -10,17 +10,19 @@ set -euo pipefail
 #   install            Full interactive setup (WG + firewall + routing + multihop)
 #   add-client <name>  Add a peer to wg0, generate .conf + QR
 #   remove-client <n>  Remove a peer from wg0, delete .conf
-#   list-clients       Show active peers on wg0
-#   multihog [on|off]  Toggle traffic exit via wg1 (Surfshark/multihop)
+#   list-clients       List configured clients
+#   multihog [on|off]  Toggle traffic exit via wg1 (multihop)
 #   status             Dashboard
 #   watchdog           Self-heal (run via cron)
+#   failover           Switch provider (requires WG2_* vars)
+#   tor [on|off]       Route VPS traffic through Tor
 #   uninstall          Revert everything
-#   recover            Emergency recovery (restores iptables + cleans WG)
+#   recover            Emergency recovery (restore iptables + clean WG)
 #   test               Self-test in isolated network namespaces
 #
 # Usage:
-#   DRY_RUN=1 bash wg-multihop.sh install   # simulate without changes
-#   bash wg-multihop.sh add-client pepe     # add a client
+#   DRY_RUN=1 bash wg-multihop.sh install           # simulate
+#   bash wg-multihop.sh add-client pepe --expires 7d # client expires
 # =============================================================================
 
 # --- Config defaults (env vars override) ---
@@ -29,6 +31,7 @@ WG_DIR="${WG_DIR:-/etc/wireguard}"
 CLIENT_DIR="${CLIENT_DIR:-/home/wireguard/clients-peers}"
 SURFSHARK_CONF="${SURFSHARK_CONF:-$(cd "$(dirname "$0")" && pwd)/surfshark.conf}"
 MULTIHOP_STATE="${WG_DIR}/.multihop_state"
+ACTIVE_PROVIDER="${WG_DIR}/.active_provider"
 DRY_RUN="${DRY_RUN:-0}"
 BATCH="${BATCH:-0}"  # 1 = non-interactive (uses defaults or env vars)
 SSH_PORT="${SSH_PORT:-22}"
@@ -44,6 +47,19 @@ CLIENT_KEEPALIVE="${CLIENT_KEEPALIVE:-25}"
 WG_HANDSHAKE_TIMEOUT="${WG_HANDSHAKE_TIMEOUT:-180}"
 MIN_RAM_MB="${MIN_RAM_MB:-50}"
 PING_TARGETS="${PING_TARGETS:-8.8.8.8 1.1.1.1}"
+
+# Backup provider (multi-provider failover)
+WG2_ENDPOINT="${WG2_ENDPOINT:-}"
+SS2_PUB="${SS2_PUB:-}"
+WG2_VPS_IP="${WG2_VPS_IP:-10.16.0.2/32}"
+WG2_MTU="${WG2_MTU:-${WG1_MTU}}"
+WG2_KEEPALIVE="${WG2_KEEPALIVE:-5}"
+
+# Tor transparent proxy
+TOR_PORT="${TOR_PORT:-9040}"
+TOR_DNS_PORT="${TOR_DNS_PORT:-5353}"
+TOR_SOCKS_PORT="${TOR_SOCKS_PORT:-9050}"
+TOR_USER="${TOR_USER:-debian-tor}"
 
 # Cargar config persistente de instalaciones anteriores
 WG_PERSIST="${WG_DIR}/.wg-multihop-config"
@@ -220,7 +236,7 @@ __detect_ip() {
 }
 
 __install_wireguard() {
-    title "[1/6] Instalando WireGuard"
+    title "[1/7] Instalando WireGuard"
     log "Installing packages..."
     if command -v apt &>/dev/null; then
         dry DEBIAN_FRONTEND=noninteractive apt update -qq 2>/dev/null || true
@@ -250,7 +266,7 @@ __install_wireguard() {
 
 __install_firewall() {
     local wan="$1"
-    title "[2/6] Configuring firewall"
+    title "[2/7] Configuring firewall"
 
     # ufw interfiere con nuestras reglas — desactivarlo
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qi active; then
@@ -283,7 +299,7 @@ __install_firewall() {
 }
 
 __install_mgmt_routing() {
-    title "[3/6] Anti-lockout (tabla mgmt 100)"
+    title "[3/7] Anti-lockout (tabla mgmt 100)"
     # Crear tabla (limpiar duplicados previos)
     dry sed -i '/^100\s\+mgmt/d' /etc/iproute2/rt_tables 2>/dev/null || true
     dry bash -c "echo '100 mgmt' >> /etc/iproute2/rt_tables"
@@ -301,7 +317,7 @@ __install_mgmt_routing() {
 }
 
 __install_wg0() {
-    title "[5/6] Configuring wg0 (clients)"
+    title "[6/7] Configuring wg0 (clients)"
     local priv
     priv=$(cat "${WG_DIR}/vps_private.key" 2>/dev/null || wg genkey)
     local pub
@@ -363,7 +379,7 @@ EOF
 
 __install_wg1() {
     local vps_ip="$1"
-    title "[4/6] Configuring wg1 — Surfshark"
+    title "[4/7] Configuring wg1 — primary provider"
 
     if [[ -z "${WG1_ENDPOINT:-}" || -z "${SS_PUB:-}" ]]; then
         err "Missing Surfshark data (WG1_ENDPOINT or SS_PUB)"
@@ -402,8 +418,46 @@ EOF
     dry bash -c "echo 'ON' > '${MULTIHOP_STATE}'"
 }
 
+__install_wg2() {
+    local vps_ip="$1"
+    title "[5/7] Configuring wg2 — backup provider"
+
+    if [[ -z "${WG2_ENDPOINT:-}" || -z "${SS2_PUB:-}" ]]; then
+        err "Missing backup provider data (WG2_ENDPOINT or SS2_PUB)"
+        return 1
+    fi
+
+    if [[ -f "${WG_DIR}/vps_private.key" ]]; then
+        local priv
+        priv=$(cat "${WG_DIR}/vps_private.key")
+    else
+        err "No VPS private key found"
+        return 1
+    fi
+
+    cat > "${WG_DIR}/wg2.conf" << EOF
+[Interface]
+PrivateKey = ${priv}
+Address = ${vps_ip}/32
+MTU = ${WG2_MTU}
+Table = off
+
+[Peer]
+PublicKey = ${SS2_PUB}
+Endpoint = ${WG2_ENDPOINT}
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = ${WG2_KEEPALIVE}
+EOF
+    dry chmod 600 "${WG_DIR}/wg2.conf"
+    log "Bringing up wg2..."
+    run_wg_quick "${WG_DIR}/wg2.conf" up || true
+    local peer
+    peer=$(wg show wg2 peers 2>/dev/null | head -1 || true)
+    [[ -n "$peer" ]] && dry wg set wg2 peer "$peer" endpoint "${WG2_ENDPOINT}" 2>/dev/null || true
+}
+
 __install_watchdog() {
-    title "[6/6] Watchdog + Cron"
+    title "[7/7] Watchdog + Cron"
     local script_path
     script_path=$(readlink -f "$0")
     # Usar /etc/cron.d (formato correcto: incluye usuario root)
@@ -621,6 +675,9 @@ cmd_install() {
     if [[ "$MULTIHOP_ENABLE" == "1" ]]; then
         WG1_VPS_IP="${WG1_VPS_IP:-10.2.0.2/32}"
         __install_wg1 "${WG1_VPS_IP%/*}"
+        if [[ -n "${WG2_ENDPOINT:-}" && -n "${SS2_PUB:-}" ]]; then
+            __install_wg2 "${WG2_VPS_IP%/*}"
+        fi
     fi
     __install_wg0
     [[ "$WD_ENABLE" == "1" ]] && __install_watchdog
@@ -641,6 +698,9 @@ EOF
 SS_PUB="${SS_PUB:-}"
 WG1_ENDPOINT="${WG1_ENDPOINT:-}"
 WG1_VPS_IP="${WG1_VPS_IP:-}"
+WG2_ENDPOINT="${WG2_ENDPOINT:-}"
+SS2_PUB="${SS2_PUB:-}"
+WG2_VPS_IP="${WG2_VPS_IP:-}"
 EOF2
         fi
     fi
@@ -670,28 +730,29 @@ __post_install_validate() {
         fi
     done
 
-    # 2. Handshake wg1
-    if wg show wg1 &>/dev/null 2>&1; then
-        local peer_hs
-        peer_hs=$(wg show wg1 latest-handshakes 2>/dev/null | awk '{print $2}' || echo "0")
-        if [[ -n "$peer_hs" ]] && [[ "$peer_hs" -gt 0 ]]; then
-            local now
-            now=$(date +%s)
-            log "Handshake wg1: hace $((now - peer_hs)) segundos"
-        else
-            warn "wg1 handshake: not yet established"
-            warn "  Verifique que el endpoint ${WG1_ENDPOINT:-} es correcto"
-            errors=1
+    # 2. Handshake providers
+    for iface in wg1 wg2; do
+        if wg show "$iface" &>/dev/null 2>&1; then
+            local peer_hs
+            peer_hs=$(wg show "$iface" latest-handshakes 2>/dev/null | awk '{print $2}' || echo "0")
+            if [[ -n "$peer_hs" ]] && [[ "$peer_hs" -gt 0 ]]; then
+                local now
+                now=$(date +%s)
+                log "Handshake ${iface}: hace $((now - peer_hs)) segundos"
+            else
+                warn "${iface} handshake: not yet established"
+                errors=1
+            fi
+            local pub
+            pub=$(wg show "$iface" peers 2>/dev/null | head -1 || true)
+            if [[ -n "$pub" ]]; then
+                log "Peer ${iface}: ${pub:0:20}..."
+                local ep
+                ep=$(wg show "$iface" endpoints 2>/dev/null | awk '{print $2}' || true)
+                [[ -n "$ep" ]] && log "Endpoint ${iface}: ${ep}"
+            fi
         fi
-        local wg1_pub
-        wg1_pub=$(wg show wg1 peers 2>/dev/null | head -1 || true)
-        if [[ -n "$wg1_pub" ]]; then
-            log "Peer wg1: ${wg1_pub:0:20}..."
-            local wg1_endpoint
-            wg1_endpoint=$(wg show wg1 endpoints 2>/dev/null | awk '{print $2}' || true)
-            [[ -n "$wg1_endpoint" ]] && log "Endpoint: ${wg1_endpoint}"
-        fi
-    fi
+    done
 
     # 3. Routing table wg_clients
     if ip route show table wg_clients 2>/dev/null | grep "default" >/dev/null 2>&1; then
@@ -710,12 +771,16 @@ __post_install_validate() {
     fi
 
     # 4. FORWARD rules
-    if iptables -L FORWARD -v -n 2>/dev/null | grep -q "wg0.*wg1"; then
-        log "FORWARD wg0→wg1 OK"
-    else
-        warn "FORWARD wg0→wg1 faltante"
-        errors=1
-    fi
+    for iface in wg1 wg2; do
+        if [[ -f "${WG_DIR}/${iface}.conf" ]] || wg show "$iface" &>/dev/null 2>&1; then
+            if iptables -L FORWARD -v -n 2>/dev/null | grep -q "wg0.*${iface}"; then
+                log "FORWARD wg0→${iface} OK"
+            else
+                warn "FORWARD wg0→${iface} missing"
+                errors=1
+            fi
+        fi
+    done
 
     # 5. NAT MASQUERADE
     if iptables -t nat -L POSTROUTING 2>/dev/null | grep -q "MASQUERADE"; then
@@ -749,28 +814,70 @@ __post_install_validate() {
     echo ""
 }
 
+__parse_duration() {
+    local dur="$1"
+    local unit="${dur: -1}"
+    local num="${dur%?}"
+    local seconds=0
+    case "$unit" in
+        s|S) seconds=$num ;;
+        m|M) seconds=$((num * 60)) ;;
+        h|H) seconds=$((num * 3600)) ;;
+        d|D) seconds=$((num * 86400)) ;;
+        *) seconds=$((dur * 86400)) ;;
+    esac
+    echo "$seconds"
+}
+
+__format_remaining() {
+    local secs="$1"
+    if [[ "$secs" -le 0 ]]; then echo "expired"; return; fi
+    local d=$((secs / 86400)) h=$(( (secs % 86400) / 3600 )) m=$(( (secs % 3600) / 60 ))
+    local out=""
+    [[ "$d" -gt 0 ]] && out="${d}d "
+    [[ "$h" -gt 0 ]] && out="${out}${h}h "
+    out="${out}${m}m"
+    echo "$out"
+}
+
 cmd_add_client() {
     check_root
-    local name="${1:-}"
+    local name="${1:-}" expires=""
+    shift 2>/dev/null || true
+    if [[ "${1:-}" == "--expires" ]]; then
+        shift 2>/dev/null || true
+        expires="${1:-}"
+        shift 2>/dev/null || true
+    fi
     if [[ -z "$name" ]]; then
-        err "Usage: $0 add-client <nombre>"
+        err "Usage: $0 add-client <name> [--expires <Nd|Nh|Nm>]"
         exit 1
     fi
     if [[ ! -f "${WG_DIR}/wg0.conf" ]]; then
-        err "wg0.conf no existe. Run 'install' first."
+        err "wg0.conf does not exist. Run 'install' first."
         exit 1
     fi
 
-    log "Generating keys para ${name}..."
+    log "Generating keys for ${name}..."
     local priv pub ip
     priv=$(wg genkey)
     pub=$(echo "$priv" | wg pubkey)
     ip=$(__get_next_ip)
 
-    log "IP asignada: ${ip%/*}"
+    log "IP assigned: ${ip%/*}"
     __add_peer_to_wg0 "$name" "$pub" "$ip"
 
-    # Generar .conf
+    # Save expiry if set
+    local expiry_ts=0
+    if [[ -n "$expires" ]]; then
+        local delta
+        delta=$(__parse_duration "$expires")
+        expiry_ts=$(( $(date +%s) + delta ))
+        echo "$expiry_ts" > "${CLIENT_DIR}/.${name}.expires" 2>/dev/null || true
+        log "Expires in ${expires} ($(__format_remaining "$delta") remaining)"
+    fi
+
+    # Generate .conf
     local server_pub wan_endpoint
     server_pub=$(cat "${WG_DIR}/vps_public.key")
     wan_endpoint=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'src \K\S+' | head -1 || echo "0.0.0.0")
@@ -791,7 +898,7 @@ PersistentKeepalive = ${CLIENT_KEEPALIVE}
 EOF
     log "Configuration: ${CLIENT_DIR}/${name}.conf"
     if command -v qrencode &>/dev/null; then
-        log "QR Code (escanea con la app WireGuard):"
+        log "QR Code (scan with WireGuard app):"
         dry qrencode -t ansiutf8 < "${CLIENT_DIR}/${name}.conf" 2>/dev/null || true
     fi
 }
@@ -805,29 +912,45 @@ cmd_remove_client() {
     fi
     log "Removing client ${name}..."
     __remove_peer_from_wg0 "$name"
-    dry rm -f "${CLIENT_DIR}/${name}.conf"
+    dry rm -f "${CLIENT_DIR}/${name}.conf" "${CLIENT_DIR}/.${name}.expires"
     log "Client ${name} removed"
 }
 
 cmd_list_clients() {
     check_root
     if [[ ! -f "${WG_DIR}/wg0.conf" ]]; then
-        err "wg0.conf no existe"
+        err "wg0.conf does not exist"
         exit 1
     fi
     echo ""
-    title "Clients configurados"
+    title "Clients"
     grep -B1 "^AllowedIPs" "${WG_DIR}/wg0.conf" 2>/dev/null | grep -v "^--" | \
         sed 's/# //' | sed 's/AllowedIPs = //' | paste - - | \
-        awk '{ printf "  %-20s %s\n", $1, $2 }' || echo "  (ninguno)"
+        awk '{ printf "  %-20s %s\n", $1, $2 }' || echo "  (none)"
+    # Show expiry info
+    local now cname
+    now=$(date +%s)
+    while read -r cname _; do
+        local ef="${CLIENT_DIR}/.${cname}.expires"
+        if [[ -f "$ef" ]]; then
+            local ets remaining
+            ets=$(cat "$ef" 2>/dev/null || echo 0)
+            remaining=$((ets - now))
+            if [[ "$remaining" -le 0 ]]; then
+                printf "  %-20s expired\n" "$cname"
+            else
+                printf "  %-20s expires in %s\n" "$cname" "$(__format_remaining "$remaining")"
+            fi
+        fi
+    done < <(grep -B1 "^AllowedIPs" "${WG_DIR}/wg0.conf" 2>/dev/null | grep "#" | sed 's/# //' | paste - - 2>/dev/null || true)
     echo ""
 
     if command -v wg &>/dev/null && wg show wg0 &>/dev/null 2>&1; then
-        title "Peers activos (handshake)"
+        title "Active peers (handshake)"
         wg show wg0 latest-handshakes | awk '{
             if ($2 > 0) printf "  %s → %d s ago\n", $1, systime() - $2
-            else printf "  %s → sin handshake\n", $1
-        }' 2>/dev/null || echo "  (no se pudo leer)"
+            else printf "  %s → no handshake\n", $1
+        }' 2>/dev/null || echo "  (unavailable)"
     fi
 }
 
@@ -846,7 +969,7 @@ cmd_multihop() {
             err "wg1 is not configured. Run 'install' first."
             exit 1
         fi
-        # Quitar ruta directa por WAN (si existe)
+        # Remove direct WAN route if exists
         local wan gw
         wan=$(__detect_wan)
         gw=$(ip route show default 2>/dev/null | grep -oP 'via \K\S+' | head -1 || echo "")
@@ -854,32 +977,46 @@ cmd_multihop() {
             dry ip route del default via "$gw" dev "$wan" table wg_clients 2>/dev/null || true
             dry iptables -t nat -D POSTROUTING -o "$wan" -j MASQUERADE 2>/dev/null || true
         fi
-        # Activar wg1 + MASQUERADE
+        # Bring up wg1
         dry wg-quick up "${WG_DIR}/wg1.conf" 2>/dev/null || true
         dry wg set wg1 peer "$peer" endpoint "$(grep -oP 'Endpoint = \K\S+' "${WG_DIR}/wg1.conf" 2>/dev/null)" 2>/dev/null || true
+        # Bring up wg2 if configured
+        if [[ -f "${WG_DIR}/wg2.conf" ]]; then
+            dry wg-quick up "${WG_DIR}/wg2.conf" 2>/dev/null || true
+            local peer2
+            peer2=$(wg show wg2 peers 2>/dev/null | head -1 || true)
+            [[ -n "$peer2" ]] && dry wg set wg2 peer "$peer2" endpoint "$(grep -oP 'Endpoint = \K\S+' "${WG_DIR}/wg2.conf" 2>/dev/null)" 2>/dev/null || true
+        fi
         dry ip rule add to "${WG0_SUBNET}" table main priority 99 2>/dev/null || true
         dry ip route add default dev wg1 table wg_clients 2>/dev/null || true
         dry iptables -t nat -C POSTROUTING -o wg1 -j MASQUERADE 2>/dev/null || dry iptables -t nat -A POSTROUTING -o wg1 -j MASQUERADE 2>/dev/null || true
         dry bash -c "echo 'ON' > '${MULTIHOP_STATE}'"
-        log "Multihop enabled — client traffic exits por Surfshark"
+        dry bash -c "echo 'wg1' > '${ACTIVE_PROVIDER}'"
+        log "Multihop enabled — client traffic exits via primary provider"
     elif [[ "$action" == "off" ]]; then
         [[ "$current" == "OFF" ]] && { info "Multihop is already OFF"; exit 0; }
         log "Disabling multihop..."
         local wan gw
         wan=$(__detect_wan)
         gw=$(ip route show default 2>/dev/null | grep -oP 'via \K\S+' | head -1 || echo "")
-        # Remove MASQUERADE from wg1 + switch route to direct WAN
-        dry iptables -t nat -D POSTROUTING -o wg1 -j MASQUERADE 2>/dev/null || true
-        dry wg-quick down "${WG_DIR}/wg1.conf" 2>/dev/null || true
+        # Remove MASQUERADE from providers + bring them down
+        for iface in wg1 wg2; do
+            if [[ -f "${WG_DIR}/${iface}.conf" ]] && wg show "$iface" &>/dev/null 2>&1; then
+                dry iptables -t nat -D POSTROUTING -o "$iface" -j MASQUERADE 2>/dev/null || true
+                dry wg-quick down "${WG_DIR}/${iface}.conf" 2>/dev/null || true
+            fi
+        done
         if [[ -n "$gw" ]]; then
             dry ip route replace default via "$gw" dev "$wan" table wg_clients 2>/dev/null || \
                 dry ip route add default via "$gw" dev "$wan" table wg_clients 2>/dev/null || true
             dry iptables -t nat -A POSTROUTING -o "$wan" -j MASQUERADE 2>/dev/null || true
             dry bash -c "echo 'OFF' > '${MULTIHOP_STATE}'"
-            log "Multihop disabled — client traffic exits por IP directa del VPS (${wan})"
+            dry bash -c "echo '' > '${ACTIVE_PROVIDER}'"
+            log "Multihop disabled — client traffic exits via direct VPS IP (${wan})"
         else
-            warn "No gateway detected WAN — clients without internet"
+            warn "No WAN gateway detected — clients without internet"
             dry bash -c "echo 'OFF' > '${MULTIHOP_STATE}'"
+            dry bash -c "echo '' > '${ACTIVE_PROVIDER}'"
         fi
     else
         # toggle
@@ -891,6 +1028,63 @@ cmd_multihop() {
     fi
 }
 
+__set_active_provider() {
+    local iface="$1"
+    local tb="wg_clients"
+    if [[ "$iface" != "wg1" && "$iface" != "wg2" ]]; then
+        warn "Invalid provider: $iface (use wg1 or wg2)"
+        return 1
+    fi
+    if ! ip link show "$iface" &>/dev/null; then
+        warn "Interface $iface does not exist"
+        return 1
+    fi
+    log "Switching active provider to $iface..."
+    # Remove current default from wg_clients table
+    for tbl in "$tb" 200; do
+        local cur
+        cur=$(ip route show table "$tbl" 2>/dev/null | grep "^default" || true)
+        [[ -n "$cur" ]] && dry ip route del table "$tbl" "$cur" 2>/dev/null || true
+    done
+    # Add new default via active provider
+    dry ip route add default dev "$iface" table "$tb" 2>/dev/null || \
+    dry ip route add default dev "$iface" table 200 2>/dev/null || true
+    dry bash -c "echo '${iface}' > '${ACTIVE_PROVIDER}'"
+    info "Active provider: ${iface}"
+}
+
+cmd_failover() {
+    check_root
+    local target="${1:-}"
+    local current="wg1"
+    [[ -f "$ACTIVE_PROVIDER" ]] && current=$(cat "$ACTIVE_PROVIDER")
+
+    if [[ -z "$target" ]]; then
+        echo ""
+        title "Failover Status"
+        echo "  Active provider: $current"
+        for iface in wg1 wg2; do
+            if wg show "$iface" &>/dev/null 2>&1; then
+                local hs
+                hs=$(wg show "$iface" latest-handshakes 2>/dev/null | awk '{if($2>0) print systime()-$2" s ago"; else print "no handshake"}')
+                echo "  $iface handshake: $hs"
+            fi
+        done
+        echo ""
+        return
+    fi
+
+    if [[ "$target" != "wg1" && "$target" != "wg2" ]]; then
+        err "Usage: $0 failover [wg1|wg2]"
+        exit 1
+    fi
+    if [[ "$target" == "$current" ]]; then
+        info "Already using $target"
+        exit 0
+    fi
+    __set_active_provider "$target"
+}
+
 cmd_status() {
     echo ""
     title "WireGuard Multihop — Dashboard"
@@ -898,10 +1092,13 @@ cmd_status() {
     local mh="OFF"
     [[ -f "$MULTIHOP_STATE" ]] && mh=$(cat "$MULTIHOP_STATE")
     echo -e "  Multihop:     $([ "$mh" == "ON" ] && echo -e "${GREEN}ON${NC}" || echo -e "${YELLOW}OFF${NC}")"
+    local active="wg1"
+    [[ -f "$ACTIVE_PROVIDER" ]] && active=$(cat "$ACTIVE_PROVIDER")
+    echo -e "  Active:       ${CYAN}${active}${NC}"
     echo ""
 
     # WG interfaces
-    for iface in wg0 wg1; do
+    for iface in wg0 wg1 wg2; do
         if wg show "$iface" &>/dev/null 2>&1; then
             title "${iface}"
             wg show "$iface" 2>/dev/null | head -6 | sed 's/^/  /'
@@ -925,6 +1122,142 @@ cmd_status() {
     echo ""
 }
 
+__install_tor() {
+    if command -v tor &>/dev/null; then
+        info "Tor already installed"
+        return 0
+    fi
+    log "Installing Tor..."
+    if command -v apt &>/dev/null; then
+        dry bash -c "apt update && apt install -y tor socat" 2>/dev/null || \
+        dry bash -c "apt install -y tor socat" 2>/dev/null || true
+    elif command -v dnf &>/dev/null; then
+        dry bash -c "dnf install -y tor socat" 2>/dev/null || true
+    elif command -v yum &>/dev/null; then
+        dry bash -c "yum install -y tor socat" 2>/dev/null || true
+    elif command -v apk &>/dev/null; then
+        dry bash -c "apk add tor socat" 2>/dev/null || true
+    else
+        err "No package manager found for Tor install"
+        return 1
+    fi
+    log "Tor installed"
+}
+
+__tor_config() {
+    local conf="/etc/tor/torrc"
+    if [[ -f "$conf" ]]; then
+        # Backup original
+        dry cp "$conf" "${conf}.bak.$(date +%s)" 2>/dev/null || true
+    fi
+    cat > "$conf" << TOREOF
+## wg-multihop Tor config
+## Transparent proxy + DNS
+SOCKSPort 127.0.0.1:${TOR_SOCKS_PORT}
+TransPort 127.0.0.1:${TOR_PORT}
+DNSPort 127.0.0.1:${TOR_DNS_PORT}
+## Don't use exit nodes for local/WG ranges
+ExitPolicy reject 10.0.0.0/8:*
+ExitPolicy reject 172.16.0.0/12:*
+ExitPolicy reject 192.168.0.0/16:*
+## Hardware acceleration
+HardwareAccel 1
+## Log
+Log notice syslog
+DataDirectory /var/lib/tor
+TOREOF
+    dry chmod 644 "$conf"
+}
+
+cmd_tor() {
+    check_root
+    local action="${1:-status}"
+    local tor_running=0
+    pidof tor &>/dev/null && tor_running=1
+
+    case "$action" in
+        on|start)
+            if [[ "$tor_running" == "1" ]]; then
+                info "Tor is already running"
+                exit 0
+            fi
+            __install_tor || exit 1
+            __tor_config
+            dry bash -c "systemctl enable tor 2>/dev/null || true"
+            dry bash -c "systemctl restart tor 2>/dev/null || service tor restart 2>/dev/null || true"
+            sleep 2
+            if pidof tor &>/dev/null; then
+                log "Tor started (SOCKS :${TOR_SOCKS_PORT}, Trans :${TOR_PORT}, DNS :${TOR_DNS_PORT})"
+            else
+                err "Tor failed to start — check journalctl -u tor"
+                exit 1
+            fi
+            # iptables: redirect VPS-originated TCP through Tor
+            # Create TOR chain in nat table
+            iptables -t nat -N TOR 2>/dev/null || iptables -t nat -F TOR 2>/dev/null || true
+            # Exclude traffic going out via wg interfaces
+            for iface in wg0 wg1 wg2; do
+                iptables -t nat -A TOR -o "$iface" -j RETURN 2>/dev/null || true
+            done
+            # Exclude local/rfc1918
+            for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+                iptables -t nat -A TOR -d "$net" -j RETURN 2>/dev/null || true
+            done
+            # Exclude Tor's own traffic
+            iptables -t nat -A TOR -m owner --uid-owner "$TOR_USER" -j RETURN 2>/dev/null || true
+            # Redirect remaining TCP to TransPort
+            iptables -t nat -A TOR -p tcp -j REDIRECT --to-port "${TOR_PORT}" 2>/dev/null || true
+            # Apply to OUTPUT chain
+            iptables -t nat -A OUTPUT -p tcp -j TOR 2>/dev/null || true
+            # Redirect UDP 53 through Tor DNS
+            iptables -t nat -A OUTPUT -p udp --dport 53 -j REDIRECT --to-port "${TOR_DNS_PORT}" 2>/dev/null || true
+            # Accept DNS through Tor's DNSPort
+            iptables -A INPUT -p udp --dport "${TOR_DNS_PORT}" -s 127.0.0.1 -j ACCEPT 2>/dev/null || true
+            log "Tor transparent proxy active"
+            ;;
+        off|stop)
+            if [[ "$tor_running" == "0" ]]; then
+                info "Tor is not running"
+            fi
+            # Remove iptables rules
+            iptables -t nat -D OUTPUT -p tcp -j TOR 2>/dev/null || true
+            iptables -t nat -F TOR 2>/dev/null || true
+            iptables -t nat -X TOR 2>/dev/null || true
+            iptables -t nat -D OUTPUT -p udp --dport 53 -j REDIRECT --to-port "${TOR_DNS_PORT}" 2>/dev/null || true
+            iptables -D INPUT -p udp --dport "${TOR_DNS_PORT}" -s 127.0.0.1 -j ACCEPT 2>/dev/null || true
+            dry bash -c "systemctl stop tor 2>/dev/null || service tor stop 2>/dev/null || pkill tor 2>/dev/null || true"
+            log "Tor stopped and rules cleaned"
+            ;;
+        status)
+            echo ""
+            title "Tor Status"
+            if [[ "$tor_running" == "1" ]]; then
+                echo -e "  Status:   ${GREEN}running${NC}"
+                echo "  SOCKS:    127.0.0.1:${TOR_SOCKS_PORT}"
+                echo "  Trans:    127.0.0.1:${TOR_PORT}"
+                echo "  DNS:      127.0.0.1:${TOR_DNS_PORT}"
+                # Show active circuits
+                local circuits
+                circuits=$(echo -e "GETINFO circuit-status" | nc -w1 127.0.0.1 "${TOR_SOCKS_PORT}" 2>/dev/null | grep "BUILT" | wc -l || echo "0")
+                echo "  Circuits: ${circuits}"
+                # Check if TOR iptables chain exists
+                if iptables -t nat -L TOR &>/dev/null 2>&1; then
+                    echo -e "  Proxy:    ${GREEN}active${NC}"
+                else
+                    echo -e "  Proxy:    ${YELLOW}inactive${NC}"
+                fi
+            else
+                echo -e "  Status:   ${YELLOW}stopped${NC}"
+            fi
+            echo ""
+            ;;
+        *)
+            err "Usage: $0 tor [on|off|status]"
+            exit 1
+            ;;
+    esac
+}
+
 cmd_watchdog() {
     # Silent — corre cada 5 min desde cron, solo logea si repara algo
     local logfile="/var/log/wg-watchdog.log"
@@ -936,22 +1269,44 @@ cmd_watchdog() {
         wg-quick up "${WG_DIR}/wg0.conf" 2>/dev/null && fixed=1
     fi
 
-    # 2. wg1 si multihop ON
+    # 2. Active provider check (wg1 or wg2) — failover + restart
     if [[ -f "$MULTIHOP_STATE" ]] && [[ "$(cat "$MULTIHOP_STATE")" == "ON" ]]; then
-        if ! wg show wg1 &>/dev/null 2>&1; then
-            echo "[$(date)] wg1 down — restarting" >> "$logfile"
-            wg-quick up "${WG_DIR}/wg1.conf" 2>/dev/null && fixed=1
+        local cur="wg1"
+        [[ -f "$ACTIVE_PROVIDER" ]] && cur=$(cat "$ACTIVE_PROVIDER")
+        local backup=""
+        if [[ -f "${WG_DIR}/wg2.conf" ]]; then
+            [[ "$cur" == "wg1" ]] && backup="wg2" || backup="wg1"
+        fi
+
+        if ! wg show "$cur" &>/dev/null 2>&1; then
+            echo "[$(date)] ${cur} down — attempting failover" >> "$logfile"
+            if [[ -n "$backup" ]] && [[ -f "${WG_DIR}/${backup}.conf" ]] && wg show "$backup" &>/dev/null 2>&1; then
+                echo "[$(date)] Failing over to ${backup}" >> "$logfile"
+                __set_active_provider "$backup" &>/dev/null || true
+                fixed=1
+            else
+                echo "[$(date)] ${cur} down — restarting" >> "$logfile"
+                wg-quick up "${WG_DIR}/${cur}.conf" 2>/dev/null && fixed=1
+            fi
         else
             local handshake
-            handshake=$(wg show wg1 latest-handshakes 2>/dev/null | awk '{print $2}' || echo "0")
+            handshake=$(wg show "$cur" latest-handshakes 2>/dev/null | awk '{print $2}' || echo "0")
             if [[ -n "$handshake" ]] && [[ "$handshake" -gt 0 ]]; then
                 local now
                 now=$(date +%s)
                 if [[ $((now - handshake)) -gt ${WG_HANDSHAKE_TIMEOUT} ]]; then
-                    echo "[$(date)] wg1 handshake >${WG_HANDSHAKE_TIMEOUT}s — restarting peer" >> "$logfile"
-                    wg-quick down "${WG_DIR}/wg1.conf" 2>/dev/null
-                    sleep 1
-                    wg-quick up "${WG_DIR}/wg1.conf" 2>/dev/null && fixed=1
+                    if [[ -n "$backup" ]] && [[ -f "${WG_DIR}/${backup}.conf" ]]; then
+                        echo "[$(date)] ${cur} stale — attempting failover to ${backup}" >> "$logfile"
+                        wg-quick up "${WG_DIR}/${backup}.conf" 2>/dev/null || true
+                        sleep 1
+                        __set_active_provider "$backup" &>/dev/null || true
+                        fixed=1
+                    else
+                        echo "[$(date)] ${cur} handshake >${WG_HANDSHAKE_TIMEOUT}s — restarting" >> "$logfile"
+                        wg-quick down "${WG_DIR}/${cur}.conf" 2>/dev/null
+                        sleep 1
+                        wg-quick up "${WG_DIR}/${cur}.conf" 2>/dev/null && fixed=1
+                    fi
                 fi
             fi
         fi
@@ -977,11 +1332,13 @@ cmd_watchdog() {
 
     # 4. Routing table wg_clients (routes + blackhole)
     local tb="wg_clients"
+    local active_def="wg1"
+    [[ -f "$ACTIVE_PROVIDER" ]] && active_def=$(cat "$ACTIVE_PROVIDER")
     if ! ip route show table "$tb" 2>/dev/null | grep -q "default" && \
        ! ip route show table 200 2>/dev/null | grep -q "default"; then
-        echo "[$(date)] wg_clients default route faltante — restaurando" >> "$logfile"
-        ip route add default dev wg1 table "$tb" 2>/dev/null || \
-        ip route add default dev wg1 table 200 2>/dev/null || true
+        echo "[$(date)] wg_clients default route faltante — restaurando via ${active_def}" >> "$logfile"
+        ip route add default dev "$active_def" table "$tb" 2>/dev/null || \
+        ip route add default dev "$active_def" table 200 2>/dev/null || true
         fixed=1
     fi
     local bh_route
@@ -1013,7 +1370,24 @@ cmd_watchdog() {
         fixed=1
     fi
 
-    # 6. RAM
+    # 6. Expired clients
+    local now cname
+    now=$(date +%s)
+    while read -r cname _; do
+        local ef="${CLIENT_DIR}/.${cname}.expires"
+        if [[ -f "$ef" ]]; then
+            local ets
+            ets=$(cat "$ef" 2>/dev/null || echo 0)
+            if [[ "$now" -ge "$ets" ]]; then
+                echo "[$(date)] Client ${cname} expired — removing" >> "$logfile"
+                __remove_peer_from_wg0 "$cname"
+                dry rm -f "${CLIENT_DIR}/${cname}.conf" "$ef"
+                fixed=1
+            fi
+        fi
+    done < <(grep -B1 "^AllowedIPs" "${WG_DIR}/wg0.conf" 2>/dev/null | grep "#" | sed 's/# //' | paste - - 2>/dev/null || true)
+
+    # 7. RAM
     local mem
     mem=$(free -m | awk '/Mem:/{print $4}')
     if [[ "$mem" -lt ${MIN_RAM_MB} ]]; then
@@ -1032,7 +1406,9 @@ cmd_uninstall() {
 
     log "Deteniendo WireGuard..."
     dry wg-quick down "${WG_DIR}/wg0.conf" 2>/dev/null || true
-    dry wg-quick down "${WG_DIR}/wg1.conf" 2>/dev/null || true
+    for iface in wg1 wg2; do
+        [[ -f "${WG_DIR}/${iface}.conf" ]] && dry wg-quick down "${WG_DIR}/${iface}.conf" 2>/dev/null || true
+    done
 
     log "Limpiando reglas iptables..."
     dry iptables -P INPUT ACCEPT 2>/dev/null || true
@@ -1050,9 +1426,9 @@ cmd_uninstall() {
     dry ip route flush table mgmt 2>/dev/null || true
 
     log "Eliminando archivos..."
-    dry rm -f "${WG_DIR}/wg0.conf" "${WG_DIR}/wg1.conf" 2>/dev/null || true
+    dry rm -f "${WG_DIR}/wg0.conf" "${WG_DIR}/wg1.conf" "${WG_DIR}/wg2.conf" 2>/dev/null || true
     dry rm -f "${WG_DIR}/wg1_private.key" "${WG_DIR}/vps_private.key" "${WG_DIR}/vps_public.key" 2>/dev/null || true
-    dry rm -f "$MULTIHOP_STATE" 2>/dev/null || true
+    dry rm -f "$MULTIHOP_STATE" "$ACTIVE_PROVIDER" 2>/dev/null || true
     dry rm -rf "$CLIENT_DIR" 2>/dev/null || true
 
     log "Eliminando cron..."
@@ -1078,7 +1454,9 @@ cmd_recover() {
 
     log "Deteniendo WireGuard..."
     wg-quick down "${WG_DIR}/wg0.conf" 2>/dev/null || true
-    wg-quick down "${WG_DIR}/wg1.conf" 2>/dev/null || true
+    for iface in wg1 wg2; do
+        [[ -f "${WG_DIR}/${iface}.conf" ]] && wg-quick down "${WG_DIR}/${iface}.conf" 2>/dev/null || true
+    done
 
     log "Limpiando tablas de ruteo..."
     ip rule del to "${WG0_SUBNET}" table main 2>/dev/null || true
@@ -1099,9 +1477,9 @@ cmd_recover() {
     rm -f "$WG_PERSIST" 2>/dev/null || true
 
     log "Cleaning up config files..."
-    rm -f "${WG_DIR}/wg0.conf" "${WG_DIR}/wg1.conf" 2>/dev/null || true
+    rm -f "${WG_DIR}/wg0.conf" "${WG_DIR}/wg1.conf" "${WG_DIR}/wg2.conf" 2>/dev/null || true
     rm -f "${WG_DIR}/wg1_private.key" "${WG_DIR}/vps_private.key" "${WG_DIR}/vps_public.key" 2>/dev/null || true
-    rm -f "$MULTIHOP_STATE" 2>/dev/null || true
+    rm -f "$MULTIHOP_STATE" "$ACTIVE_PROVIDER" 2>/dev/null || true
 
     log "Recovery complete. System is in pre-install state."
 }
@@ -1471,7 +1849,7 @@ main() {
             cmd_install
             ;;
         add-client)
-            cmd_add_client "${1:-}"
+            cmd_add_client "$@"
             ;;
         remove-client)
             cmd_remove_client "${1:-}"
@@ -1490,6 +1868,14 @@ main() {
             check_root
             cmd_watchdog
             ;;
+        failover)
+            check_root
+            cmd_failover "${1:-}"
+            ;;
+        tor)
+            check_root
+            cmd_tor "${1:-status}"
+            ;;
         uninstall)
             cmd_uninstall
             ;;
@@ -1507,12 +1893,14 @@ main() {
             echo ""
             echo "  Commands:"
             echo "    install              Full interactive setup"
-            echo "    add-client <name>    Add a client"
+            echo "    add-client <name>    Add a client (--expires 7d for auto-remove)"
             echo "    remove-client <name> Remove a client"
             echo "    list-clients         List configured clients"
             echo "    multihog [on|off]    Toggle traffic exit via wg1"
             echo "    status               Dashboard"
             echo "    watchdog             Self-heal (runs via cron)"
+            echo "    failover [wg1|wg2]   Switch active provider"
+            echo "    tor [on|off|status]  Tor transparent proxy"
             echo "    uninstall            Revert everything"
             echo "    recover              Emergency recovery (restore iptables + clean WG)"
             echo "    test                 Self-test in isolated namespaces"
