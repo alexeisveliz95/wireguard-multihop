@@ -222,11 +222,21 @@ __detect_ip() {
 __install_wireguard() {
     title "[1/6] Instalando WireGuard"
     log "Installing packages..."
-    dry DEBIAN_FRONTEND=noninteractive apt update -qq 2>/dev/null || true
-    dry DEBIAN_FRONTEND=noninteractive apt install -y -qq wireguard qrencode iptables-persistent 2>/dev/null || true
+    if command -v apt &>/dev/null; then
+        dry DEBIAN_FRONTEND=noninteractive apt update -qq 2>/dev/null || true
+        dry DEBIAN_FRONTEND=noninteractive apt install -y -qq wireguard qrencode iptables-persistent 2>/dev/null || true
+    elif command -v dnf &>/dev/null; then
+        dry dnf install -y -q wireguard-tools qrencode iptables-services 2>/dev/null || true
+    elif command -v yum &>/dev/null; then
+        dry yum install -y -q wireguard-tools qrencode iptables-services 2>/dev/null || true
+    elif command -v apk &>/dev/null; then
+        dry apk add wireguard-tools qrencode iptables 2>/dev/null || true
+    else
+        warn "Unknown package manager — install wireguard-tools + qrencode + iptables manually"
+    fi
     dry mkdir -p "$WG_DIR"
     if [[ ! -f "${WG_DIR}/vps_private.key" ]]; then
-        log "Generating keys del servidor..."
+        log "Generating server keys..."
         dry bash -c "wg genkey | tee ${WG_DIR}/vps_private.key | wg pubkey > ${WG_DIR}/vps_public.key" || true
         dry chmod 600 "${WG_DIR}/vps_private.key" 2>/dev/null || true
     else
@@ -476,7 +486,7 @@ cmd_install() {
     prompt WG_PORT "WireGuard port" "$WG_PORT"
     prompt SSH_PORT "SSH port" "$SSH_PORT"
 
-    prompt MULTIHOP_ENABLE "Habilitar multihop (salida por Surfshark)" "n"
+    prompt MULTIHOP_ENABLE "Enable multihop (exit via Surfshark)" "n"
     [[ "$MULTIHOP_ENABLE" =~ ^[Yy] ]] && MULTIHOP_ENABLE=1 || MULTIHOP_ENABLE=0
 
     if [[ "$MULTIHOP_ENABLE" == "1" ]]; then
@@ -495,18 +505,18 @@ cmd_install() {
                 info "Detectado: ${SURFSHARK_CONF}"
             elif [[ "$BATCH" == "0" ]]; then
                 echo ""
-                info "Archivos .conf detectados en ${SCRIPT_DIR}:"
+                info ".conf files detected in ${SCRIPT_DIR}:"
                 local ci=0
                 for conf_f in "${CONF_FILES[@]}"; do
                     ci=$((ci+1))
                     echo "  ${ci}) $(basename "$conf_f")"
                 done
-                echo "  0)  Ingresar datos manualmente"
+                echo "  0)  Enter data manually"
                 local chosen
-                prompt chosen "Seleccione archivo para wg1 (0-${#CONF_FILES[@]})" ""
+                prompt chosen "Select wg1 config file (0-${#CONF_FILES[@]})" ""
                 if [[ "$chosen" =~ ^[0-9]+$ ]] && [[ "$chosen" -ge 1 ]] && [[ "$chosen" -le "${#CONF_FILES[@]}" ]]; then
                     SURFSHARK_CONF="${CONF_FILES[$((chosen-1))]}"
-                    info "Usando: ${SURFSHARK_CONF}"
+                    info "Using: ${SURFSHARK_CONF}"
                 fi
             fi
         fi
@@ -541,20 +551,20 @@ cmd_install() {
                 fi
 
                 if [[ -z "$WG1_ENDPOINT" || -z "$SS_PUB" ]]; then
-                    warn "Archivo ${SURFSHARK_CONF} incompleto — completando manualmente"
+                    warn "File incomplete — filling manually"
                 else
                     info "Configuration extracted de ${SURFSHARK_CONF}"
                 fi
             else
                 # Formato legacy (variables shell)
-                info "Leyendo ${SURFSHARK_CONF}..."
+                info "Reading ${SURFSHARK_CONF}..."
                 source "$SURFSHARK_CONF"
                 WG1_VPS_IP="${WG1_VPS_IP:-10.2.0.2/32}"
             fi
         fi
 
         # Completar valores faltantes
-        [[ -z "${SS_CITY:-}" ]] && prompt SS_CITY "Ciudad Surfshark (usa-atl, usa-ny, usa-la)" "usa-atl"
+        [[ -z "${SS_CITY:-}" ]] && prompt SS_CITY "Surfshark city (usa-atl, usa-ny, usa-la)" "usa-atl"
         [[ -z "${WG1_ENDPOINT:-}" ]] && prompt WG1_ENDPOINT "Endpoint wg1 (IP:puerto)" ""
         [[ -z "${SS_PUB:-}" ]] && prompt SS_PUB "Public key del peer Surfshark" ""
         [[ -z "${WG1_VPS_IP:-}" ]] && prompt WG1_VPS_IP "IP interna wg1 (VPS)" "10.2.0.2/32"
@@ -598,8 +608,8 @@ cmd_install() {
                 sed -i '/^200 wg_clients/d' /etc/iproute2/rt_tables 2>/dev/null || true
                 sed -i '/^100 mgmt/d' /etc/iproute2/rt_tables 2>/dev/null || true
             fi
-            warn "Revise los errores arriba y corrija antes de reintentar."
-            warn "Si necesita recuperarse totalmente: bash $0 recover"
+            warn "Check errors above and fix before retrying."
+            warn "For full recovery: bash $0 recover"
         fi
     }
     trap cleanup_rollback EXIT
@@ -714,12 +724,17 @@ __post_install_validate() {
         warn "NAT MASQUERADE faltante"
     fi
 
-    # 6. IP de salida (si hay handshake)
+    # 6. IP de salida (si hay handshake, por wg1 si multihop ON)
     if command -v curl &>/dev/null; then
         local exit_ip
-        exit_ip=$(curl -s --max-time 5 ifconfig.me 2>/dev/null || true)
+        if wg show wg1 &>/dev/null 2>&1; then
+            exit_ip=$(curl -s --max-time 5 --interface wg1 ifconfig.me 2>/dev/null || true)
+        fi
+        if [[ -z "$exit_ip" ]]; then
+            exit_ip=$(curl -s --max-time 5 ifconfig.me 2>/dev/null || true)
+        fi
         if [[ -n "$exit_ip" ]]; then
-            log "IP de salida: ${exit_ip}"
+            log "Exit IP (client): ${exit_ip}"
         else
             warn "Could not determine exit IP"
         fi
@@ -738,7 +753,7 @@ cmd_add_client() {
     check_root
     local name="${1:-}"
     if [[ -z "$name" ]]; then
-        err "Uso: $0 add-client <nombre>"
+        err "Usage: $0 add-client <nombre>"
         exit 1
     fi
     if [[ ! -f "${WG_DIR}/wg0.conf" ]]; then
@@ -785,7 +800,7 @@ cmd_remove_client() {
     check_root
     local name="${1:-}"
     if [[ -z "$name" ]]; then
-        err "Uso: $0 remove-client <nombre>"
+        err "Usage: $0 remove-client <nombre>"
         exit 1
     fi
     log "Removing client ${name}..."
@@ -795,6 +810,7 @@ cmd_remove_client() {
 }
 
 cmd_list_clients() {
+    check_root
     if [[ ! -f "${WG_DIR}/wg0.conf" ]]; then
         err "wg0.conf no existe"
         exit 1
@@ -843,7 +859,7 @@ cmd_multihop() {
         dry wg set wg1 peer "$peer" endpoint "$(grep -oP 'Endpoint = \K\S+' "${WG_DIR}/wg1.conf" 2>/dev/null)" 2>/dev/null || true
         dry ip rule add to "${WG0_SUBNET}" table main priority 99 2>/dev/null || true
         dry ip route add default dev wg1 table wg_clients 2>/dev/null || true
-        dry iptables -t nat -A POSTROUTING -o wg1 -j MASQUERADE 2>/dev/null || true
+        dry iptables -t nat -C POSTROUTING -o wg1 -j MASQUERADE 2>/dev/null || dry iptables -t nat -A POSTROUTING -o wg1 -j MASQUERADE 2>/dev/null || true
         dry bash -c "echo 'ON' > '${MULTIHOP_STATE}'"
         log "Multihop enabled — client traffic exits por Surfshark"
     elif [[ "$action" == "off" ]]; then
@@ -976,9 +992,15 @@ cmd_watchdog() {
         ip route add blackhole 0.0.0.0/0 table 200 metric 999 2>/dev/null || true
         fixed=1
     fi
-    if ! ip rule show 2>/dev/null | grep "from 10.8.0.0/24.*wg_clients\|from 10.8.0.0/24.*table 200" >/dev/null 2>&1; then
+    local subnet="${WG0_SUBNET%%/*}"
+    if ! ip rule show 2>/dev/null | grep "to ${WG0_SUBNET}.*table main" >/dev/null 2>&1; then
+        echo "[$(date)] ip rule to ${WG0_SUBNET} table main faltante — restaurando" >> "$logfile"
+        ip rule add to "${WG0_SUBNET}" table main priority 99 2>/dev/null || true
+        fixed=1
+    fi
+    if ! ip rule show 2>/dev/null | grep "from ${WG0_SUBNET}.*wg_clients\|from ${WG0_SUBNET}.*table 200" >/dev/null 2>&1; then
         echo "[$(date)] ip rule wg_clients faltante — restaurando" >> "$logfile"
-        ip rule add from 10.8.0.0/24 table "$tb" priority 200 2>/dev/null || true
+        ip rule add from "${WG0_SUBNET}" table "$tb" priority 200 2>/dev/null || true
         fixed=1
     fi
 
@@ -1021,15 +1043,15 @@ cmd_uninstall() {
     dry iptables -t mangle -F 2>/dev/null || true
 
     log "Eliminando reglas de ruteo..."
-    dry ip rule del to 10.8.0.0/24 table main 2>/dev/null || true
-    dry ip rule del from 10.8.0.0/24 table wg_clients 2>/dev/null || true
+    dry ip rule del to "${WG0_SUBNET}" table main 2>/dev/null || true
+    dry ip rule del from "${WG0_SUBNET}" table wg_clients 2>/dev/null || true
     dry ip rule del from "$(__detect_ip "$(__detect_wan)" | cut -d/ -f1)" table mgmt 2>/dev/null || true
     dry ip route flush table wg_clients 2>/dev/null || true
     dry ip route flush table mgmt 2>/dev/null || true
 
     log "Eliminando archivos..."
     dry rm -f "${WG_DIR}/wg0.conf" "${WG_DIR}/wg1.conf" 2>/dev/null || true
-    dry rm -f "${WG_DIR}/wg1_private.key" 2>/dev/null || true
+    dry rm -f "${WG_DIR}/wg1_private.key" "${WG_DIR}/vps_private.key" "${WG_DIR}/vps_public.key" 2>/dev/null || true
     dry rm -f "$MULTIHOP_STATE" 2>/dev/null || true
     dry rm -rf "$CLIENT_DIR" 2>/dev/null || true
 
@@ -1059,8 +1081,8 @@ cmd_recover() {
     wg-quick down "${WG_DIR}/wg1.conf" 2>/dev/null || true
 
     log "Limpiando tablas de ruteo..."
-    ip rule del to 10.8.0.0/24 table main 2>/dev/null || true
-    ip rule del from 10.8.0.0/24 table wg_clients 2>/dev/null || true
+    ip rule del to "${WG0_SUBNET}" table main 2>/dev/null || true
+    ip rule del from "${WG0_SUBNET}" table wg_clients 2>/dev/null || true
     ip route flush table wg_clients 2>/dev/null || true
     ip route flush table mgmt 2>/dev/null || true
     sed -i '/^200 wg_clients/d' /etc/iproute2/rt_tables 2>/dev/null || true
