@@ -401,6 +401,7 @@ EOF
 
 __install_wg1() {
     local vps_ip="$1"
+    local vps_egress="${2:-0}"
     title "[4/7] Configuring wg1 — primary provider"
 
     if [[ -z "${WG1_ENDPOINT:-}" || -z "${SS_PUB:-}" ]]; then
@@ -417,12 +418,37 @@ __install_wg1() {
         priv=$(cat "${WG_DIR}/vps_private.key")
     fi
 
+    # VPS egress and hairpin route setup
+    local postup=""
+    if [[ "$vps_egress" == "1" ]]; then
+        local endpoint_ip
+        endpoint_ip=$(echo "${WG1_ENDPOINT}" | cut -d: -f1)
+        local wan_iface
+        wan_iface=$(__detect_wan)
+        local wan_gw
+        wan_gw=$(ip -4 route show default 2>/dev/null | grep -oP 'via \K\S+' | head -1 || true)
+        # Fallback to /proc/net/route if via not present
+        if [[ -z "$wan_gw" ]]; then
+            local hex
+            hex=$(awk '$2 == "00000000" {print $3}' /proc/net/route 2>/dev/null | head -1 || true)
+            if [[ -n "$hex" && "$hex" != "00000000" ]]; then
+                wan_gw=$(printf "%d.%d.%d.%d" 0x${hex:6:2} 0x${hex:4:2} 0x${hex:2:2} 0x${hex:0:2})
+            fi
+        fi
+        if [[ -n "$wan_gw" && -n "$wan_iface" ]]; then
+            postup="PostUp = ip route replace default dev %i table main
+PostUp = bash /usr/local/bin/wg-hairpin.sh ${WG_DIR}/%i.conf
+PostDown = ip route del default dev %i table main 2>/dev/null || true"
+        fi
+    fi
+
     cat > "${WG_DIR}/wg1.conf" << EOF
 [Interface]
 PrivateKey = ${priv}
 Address = ${vps_ip}/32
 MTU = ${WG1_MTU}
 Table = off
+${postup}
 
 [Peer]
 PublicKey = ${SS_PUB}
@@ -642,10 +668,19 @@ cmd_install() {
         # Completar valores faltantes
         [[ -z "${SS_CITY:-}" ]] && prompt SS_CITY "Surfshark city (usa-atl, usa-ny, usa-la)" "usa-atl"
         [[ -z "${WG1_ENDPOINT:-}" ]] && prompt WG1_ENDPOINT "Endpoint wg1 (IP:puerto)" ""
-        [[ -z "${SS_PUB:-}" ]] && prompt SS_PUB "Public key del peer Surfshark" ""
-        [[ -z "${WG1_VPS_IP:-}" ]] && prompt WG1_VPS_IP "IP interna wg1 (VPS)" "10.2.0.2/32"
+    [[ -z "${SS_PUB:-}" ]] && prompt SS_PUB "Public key del peer Surfshark" ""
 
-        __validate_surfshark_conf || { err "Invalid Surfshark config. Abortando."; exit 1; }
+    if [[ -z "${VPS_EGRESS:-}" ]]; then
+        default_egress=$(ip -4 route show default 2>/dev/null | grep -oP 'dev \K\S+' | head -1 || echo "")
+        if [[ "$default_egress" == "wg1" ]]; then
+            VPS_EGRESS="y"
+        else
+            prompt VPS_EGRESS "Route VPS own traffic via wg1 (US egress)?" "n"
+        fi
+    fi
+    [[ "$VPS_EGRESS" =~ ^[Yy] ]] && VPS_EGRESS=1 || VPS_EGRESS=0
+
+    __validate_surfshark_conf || { err "Invalid Surfshark config. Abortando."; exit 1; }
     fi
 
     prompt WD_ENABLE "Auto-repair watchdog (self-heal every 5 min)" "y"
@@ -658,6 +693,7 @@ cmd_install() {
     log "  • SSH: port ${SSH_PORT}"
     log "  • Firewall: SSH + WG + ICMP allowed, rest DROP"
     log "  • Multihop: $([ "$MULTIHOP_ENABLE" == "1" ] && echo "ON → Surfshark" || echo "OFF")"
+    log "  • VPS egress: $([ "${VPS_EGRESS:-0}" == "1" ] && echo "via wg1 (USA)" || echo "directa")"
     log "  • Anti-lockout: mgmt table (100)"
     log "  • Watchdog: $([ "$WD_ENABLE" == "1" ] && echo "every 5 min via cron" || echo "OFF")"
     echo ""
@@ -696,7 +732,7 @@ cmd_install() {
     __install_mgmt_routing
     if [[ "$MULTIHOP_ENABLE" == "1" ]]; then
         WG1_VPS_IP="${WG1_VPS_IP:-10.2.0.2/32}"
-        __install_wg1 "${WG1_VPS_IP%/*}"
+        __install_wg1 "${WG1_VPS_IP%/*}" "${VPS_EGRESS:-0}"
         if [[ -n "${WG2_ENDPOINT:-}" && -n "${SS2_PUB:-}" ]]; then
             __install_wg2 "${WG2_VPS_IP%/*}"
         fi
@@ -983,7 +1019,14 @@ cmd_multihop() {
     [[ -f "$MULTIHOP_STATE" ]] && current=$(cat "$MULTIHOP_STATE")
 
     if [[ "$action" == "on" ]]; then
-        [[ "$current" == "ON" ]] && { info "Multihop is already ON"; exit 0; }
+        if [[ "$current" == "ON" ]]; then
+            if wg show wg1 &>/dev/null 2>&1; then
+                info "Multihop is already ON"
+                exit 0
+            else
+                warn "State file says ON but wg1 is down — restarting..."
+            fi
+        fi
         log "Enabling multihop..."
         local peer
         peer=$(wg show wg1 peers 2>/dev/null | head -1 || true)
@@ -1359,7 +1402,7 @@ cmd_watchdog() {
         # Ensure systemd persist service is active
         if ! systemctl is-active --quiet wg-multihop-persist.service 2>/dev/null; then
             echo "[$(date)] systemd persist service caido — reiniciando" >> "$logfile"
-            systemctl start wg-multihop-persist.service 2>/dev/null || true
+            systemctl restart wg-multihop-persist.service 2>/dev/null || true
             fixed=1
         fi
     fi
@@ -1528,7 +1571,7 @@ cmd_recover() {
     # NOTA: NO eliminar rt_tables entries — se reusan al reinstalar
 
     log "Relanzando systemd persist service..."
-    systemctl start wg-multihop-persist.service 2>/dev/null || true
+    systemctl restart wg-multihop-persist.service 2>/dev/null || true
 
     log "Recovery completo. WireGuard configs preserved en ${WG_DIR}"
     log "Para reactivar wg-multihop: bash $0 multihog on"
