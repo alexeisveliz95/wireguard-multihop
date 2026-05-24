@@ -315,26 +315,33 @@ __install_mgmt_routing() {
         warn "No gateway detected, skipping mgmt routing (can be configured manually)"
     fi
 
-    # Instalar systemd service para persistencia en boot
-    local persist_script="/usr/local/bin/wg-multihop-persist.sh"
-    local persist_unit="/etc/systemd/system/wg-multihop-persist.service"
-    local script_dir
-    script_dir=$(dirname "$(readlink -f "$0")")
+    # Instalar systemd service para persistencia en boot.
+    # Solo cuando WG_DIR es /etc/wireguard (instalación real).
+    # Con WG_DIR alternativo (tests), se salta — el test suite
+    # se encarga de backup/restore de los archivos del host.
+    if [[ "$WG_DIR" == "/etc/wireguard" ]]; then
+        local persist_script="/usr/local/bin/wg-multihop-persist.sh"
+        local persist_unit="/etc/systemd/system/wg-multihop-persist.service"
+        local script_dir
+        script_dir=$(dirname "$(readlink -f "$0")")
 
-    dry cp "${script_dir}/wg-multihop-persist.sh" "$persist_script" 2>/dev/null || \
-        dry install -m 755 /dev/null "$persist_script"
-    dry cp "${script_dir}/wg-multihop-persist.service" "$persist_unit" 2>/dev/null || \
-        dry install -m 644 /dev/null "$persist_unit"
+        dry cp "${script_dir}/wg-multihop-persist.sh" "$persist_script" 2>/dev/null || \
+            dry install -m 755 /dev/null "$persist_script"
+        dry cp "${script_dir}/wg-multihop-persist.service" "$persist_unit" 2>/dev/null || \
+            dry install -m 644 /dev/null "$persist_unit"
 
-    if [[ "$DRY_RUN" != "1" ]]; then
-        chmod 755 "$persist_script" 2>/dev/null || true
-        chmod 644 "$persist_unit" 2>/dev/null || true
-        systemctl daemon-reload 2>/dev/null || true
-        systemctl enable wg-multihop-persist.service 2>/dev/null || true
-        systemctl start wg-multihop-persist.service 2>/dev/null || true
-        log "systemd service wg-multihop-persist installed and enabled"
+        if [[ "$DRY_RUN" != "1" ]]; then
+            chmod 755 "$persist_script" 2>/dev/null || true
+            chmod 644 "$persist_unit" 2>/dev/null || true
+            systemctl daemon-reload 2>/dev/null || true
+            systemctl enable wg-multihop-persist.service 2>/dev/null || true
+            systemctl start wg-multihop-persist.service 2>/dev/null || true
+            log "systemd service wg-multihop-persist installed and enabled"
+        else
+            echo "    [DRY-RUN] cp + chmod + systemctl enable wg-multihop-persist.service" >&2
+        fi
     else
-        echo "    [DRY-RUN] cp + chmod + systemctl enable wg-multihop-persist.service" >&2
+        log "WG_DIR=${WG_DIR} — skipping systemd service install (test/dev mode)"
     fi
 }
 
@@ -1602,6 +1609,31 @@ cmd_test() {
         for v in "$VETH_C" "$VETH_V" "$VETH_V2" "$VETH_S"; do
             ip link del "$v" 2>/dev/null || true
         done
+        # Restaurar archivos del host que el instalador modificó (ip netns
+        # no aísla el filesystem, solo la red)
+        if [[ -d "${HOST_BACKUP_DIR:-}" ]]; then
+            for f in "${HOST_BACKUP_DIR}"/*.bak; do
+                [[ ! -f "$f" ]] && continue
+                local orig_name
+                orig_name=$(basename "$f" .bak)
+                case "$orig_name" in
+                    wg-multihop-persist.sh)
+                        cp "$f" /usr/local/bin/wg-multihop-persist.sh 2>/dev/null || true
+                        chmod +x /usr/local/bin/wg-multihop-persist.sh 2>/dev/null || true
+                        ;;
+                    wg-multihop-persist.service)
+                        cp "$f" /etc/systemd/system/wg-multihop-persist.service 2>/dev/null || true
+                        systemctl daemon-reload 2>/dev/null || true
+                        ;;
+                    rt_tables)
+                        cp "$f" /etc/iproute2/rt_tables 2>/dev/null || true
+                        ;;
+                    iptables)
+                        iptables-restore < "$f" 2>/dev/null || true
+                        ;;
+                esac
+            done
+        fi
         rm -rf "$TMPDIR" 2>/dev/null || true
     }
     trap _test_cleanup EXIT
@@ -1709,6 +1741,16 @@ EOF
     else
         echo "FAIL"; failed=$((failed+1))
     fi
+
+    # Backup host files que el instalador podría modificar (ip netns no
+    # aísla el filesystem). Se restauran en _test_cleanup.
+    local HOST_BACKUP_DIR="${TMPDIR}/host-backup"
+    mkdir -p "$HOST_BACKUP_DIR"
+    for f in /usr/local/bin/wg-multihop-persist.sh /etc/systemd/system/wg-multihop-persist.service; do
+        [[ -f "$f" ]] && cp "$f" "${HOST_BACKUP_DIR}/$(basename "$f").bak"
+    done
+    cp /etc/iproute2/rt_tables "${HOST_BACKUP_DIR}/rt_tables.bak" 2>/dev/null || true
+    iptables-save > "${HOST_BACKUP_DIR}/iptables.bak" 2>/dev/null || true
 
     # --- Instalar wg-multihop dentro del VPS namespace ---
     echo ""
