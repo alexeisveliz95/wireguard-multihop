@@ -298,6 +298,125 @@ __install_firewall() {
     dry netfilter-persistent save 2>/dev/null || mkdir -p /etc/iptables 2>/dev/null; dry iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
 }
 
+# Escribe los archivos de persistencia (persist script + systemd unit)
+# a disco. Se usa en lugar de copiar archivos externos para que el
+# instalador sea autocontenido (solo wg-multihop.sh).
+__install_persist_files() {
+    local persist_script="$1"
+    local persist_unit="$2"
+
+    cat > "$persist_script" << 'PERSIST_EOF'
+#!/bin/bash
+# wg-multihop-persist.sh — Boot-time anti-lockout rules
+# Installed by wg-multihop.sh. Restores mgmt routing so SSH survives wg1 PostUp.
+set -euo pipefail
+
+WAN_IFACE="${WAN_IFACE:-}"
+WAN_IP="${WAN_IP:-}"
+WAN_GW="${WAN_GW:-}"
+WG_DIR="${WG_DIR:-/etc/wireguard}"
+PERSIST="${WG_DIR}/.wg-multihop-config"
+
+[[ -f "$PERSIST" ]] && source "$PERSIST"
+
+_hex2ip() {
+    local h="$1"
+    printf "%d.%d.%d.%d" 0x${h:6:2} 0x${h:4:2} 0x${h:2:2} 0x${h:0:2} 2>/dev/null
+}
+
+_detect_iface() {
+    local iface
+    iface=$(ip -4 route show default 2>/dev/null | grep -oP 'dev \K\S+' | head -1 || true)
+    [[ -n "$iface" ]] && { echo "$iface"; return; }
+    iface=$(awk '$2 == "00000000" && $8 == "00000000" {print $1}' /proc/net/route 2>/dev/null | head -1 || true)
+    [[ -n "$iface" ]] && { echo "$iface"; return; }
+    iface=$(ip route show table mgmt 2>/dev/null | grep -oP 'dev \K\S+' | head -1 || true)
+    [[ -n "$iface" ]] && { echo "$iface"; return; }
+    echo "eth0"
+}
+
+_detect_gw() {
+    local gw
+    gw=$(ip -4 route show default 2>/dev/null | grep -oP 'via \K\S+' | head -1 || true)
+    [[ -n "$gw" ]] && { echo "$gw"; return; }
+    gw=$(ip route show table mgmt 2>/dev/null | grep -oP 'via \K\S+' | head -1 || true)
+    [[ -n "$gw" ]] && { echo "$gw"; return; }
+    local hex
+    hex=$(awk '$2 == "00000000" {print $3}' /proc/net/route 2>/dev/null | head -1 || true)
+    if [[ -n "$hex" && "$hex" != "00000000" ]]; then
+        gw=$(_hex2ip "$hex")
+        [[ -n "$gw" ]] && { echo "$gw"; return; }
+    fi
+    echo ""
+}
+
+_detect_ip() {
+    local iface="$1" ip
+    ip=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[0-9.]+' | head -1 || true)
+    [[ -n "$ip" ]] && { echo "$ip"; return; }
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
+    echo "$ip"
+}
+
+if [[ -z "$WAN_IFACE" ]]; then WAN_IFACE=$(_detect_iface); fi
+if [[ -z "$WAN_IP" ]]; then WAN_IP=$(_detect_ip "$WAN_IFACE"); fi
+if [[ -z "$WAN_GW" ]]; then WAN_GW=$(_detect_gw); fi
+
+for entry in "100 mgmt" "200 wg_clients"; do
+    id=$(echo "$entry" | awk '{print $1}')
+    name=$(echo "$entry" | awk '{print $2}')
+    if ! grep -q "^${id}\s\+${name}" /etc/iproute2/rt_tables 2>/dev/null; then
+        echo "$entry" >> /etc/iproute2/rt_tables
+    fi
+done
+
+if [[ -n "$WAN_GW" && -n "$WAN_IP" && -n "$WAN_IFACE" ]]; then
+    if ! ip rule show 2>/dev/null | grep -q "from ${WAN_IP}.*table mgmt"; then
+        ip rule add from "$WAN_IP" table mgmt priority 100 2>/dev/null || true
+    fi
+    if ! ip route show table mgmt 2>/dev/null | grep -q default; then
+        ip route add default via "$WAN_GW" dev "$WAN_IFACE" table mgmt 2>/dev/null || true
+    fi
+fi
+
+if ! iptables -L FORWARD -n 2>/dev/null | grep -q "wg0.*wg1"; then
+    iptables -P INPUT DROP 2>/dev/null || true
+    iptables -P FORWARD DROP 2>/dev/null || true
+    iptables -P OUTPUT ACCEPT 2>/dev/null || true
+    iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    iptables -A INPUT -i lo -j ACCEPT 2>/dev/null || true
+    iptables -A INPUT -p tcp --dport "${SSH_PORT:-22}" -j ACCEPT 2>/dev/null || true
+    iptables -A INPUT -p udp --dport "${WG_PORT:-51820}" -j ACCEPT 2>/dev/null || true
+    iptables -A INPUT -p icmp -m limit --limit 10/second -j ACCEPT 2>/dev/null || true
+    iptables -A FORWARD -i wg0 -o wg1 -j ACCEPT 2>/dev/null || true
+    iptables -A FORWARD -i wg1 -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    iptables -A FORWARD -i wg0 -o "${WAN_IFACE}" -j ACCEPT 2>/dev/null || true
+    iptables -A FORWARD -i "${WAN_IFACE}" -o wg0 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    iptables -t nat -A POSTROUTING -o wg1 -j MASQUERADE 2>/dev/null || true
+fi
+PERSIST_EOF
+
+    cat > "$persist_unit" << 'UNIT_EOF'
+[Unit]
+Description=wg-multihop anti-lockout and persist rules
+Documentation=https://github.com/alexeisveliz95/wireguard-multihop
+After=network.target
+Before=wg-quick@wg1.service wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/wg-multihop-persist.sh
+RemainAfterExit=yes
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+
+    chmod 755 "$persist_script" 2>/dev/null || true
+    chmod 644 "$persist_unit" 2>/dev/null || true
+}
+
 __install_mgmt_routing() {
     title "[3/7] Anti-lockout (tabla mgmt 100)"
     # Crear tabla (limpiar duplicados previos)
@@ -322,23 +441,15 @@ __install_mgmt_routing() {
     if [[ "$WG_DIR" == "/etc/wireguard" ]]; then
         local persist_script="/usr/local/bin/wg-multihop-persist.sh"
         local persist_unit="/etc/systemd/system/wg-multihop-persist.service"
-        local script_dir
-        script_dir=$(dirname "$(readlink -f "$0")")
-
-        dry cp "${script_dir}/wg-multihop-persist.sh" "$persist_script" 2>/dev/null || \
-            dry install -m 755 /dev/null "$persist_script"
-        dry cp "${script_dir}/wg-multihop-persist.service" "$persist_unit" 2>/dev/null || \
-            dry install -m 644 /dev/null "$persist_unit"
 
         if [[ "$DRY_RUN" != "1" ]]; then
-            chmod 755 "$persist_script" 2>/dev/null || true
-            chmod 644 "$persist_unit" 2>/dev/null || true
+            __install_persist_files "$persist_script" "$persist_unit"
             systemctl daemon-reload 2>/dev/null || true
             systemctl enable wg-multihop-persist.service 2>/dev/null || true
             systemctl start wg-multihop-persist.service 2>/dev/null || true
             log "systemd service wg-multihop-persist installed and enabled"
         else
-            echo "    [DRY-RUN] cp + chmod + systemctl enable wg-multihop-persist.service" >&2
+            echo "    [DRY-RUN] wg-multihop-persist.sh + systemctl enable wg-multihop-persist.service" >&2
         fi
     else
         log "WG_DIR=${WG_DIR} — skipping systemd service install (test/dev mode)"
@@ -444,7 +555,7 @@ __install_wg1() {
         fi
         if [[ -n "$wan_gw" && -n "$wan_iface" ]]; then
             postup="PostUp = ip route replace default dev %i table main
-PostUp = bash /usr/local/bin/wg-hairpin.sh ${WG_DIR}/%i.conf
+PostUp = bash -c 'wg=\${WG_DIR}/%i.conf; gw=\$(ip route show table mgmt 2>/dev/null | grep -oP \"via \K\S+\" | head -1 || echo ${wan_gw}); host=\$(grep -oP \"^Endpoint\s*=\s*\K\S+\" \"\${wg}\" 2>/dev/null | cut -d: -f1 || true); [ -n \"\$host\" ] && for ip in \$(getent hosts \"\$host\" 2>/dev/null | awk \"{print \\\$1}\" | sort -u); do ip route add \${ip}/32 via \${gw} dev ${wan_iface} 2>/dev/null || true; done'
 PostDown = ip route del default dev %i table main 2>/dev/null || true"
         fi
     fi
